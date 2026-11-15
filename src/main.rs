@@ -527,12 +527,8 @@ impl Controller {
         let (cancel, receiver) = watch::channel(self.runtime.generation);
         let mut handles = Vec::new();
         let mut statuses = HashMap::new();
-        let global_tcp = Arc::new(Semaphore::new(
-            self.limits.global_tcp_sessions as usize,
-        ));
-        let global_udp = Arc::new(Semaphore::new(
-            self.limits.global_udp_sessions as usize,
-        ));
+        let global_tcp = Arc::new(Semaphore::new(self.limits.global_tcp_sessions as usize));
+        let global_udp = Arc::new(Semaphore::new(self.limits.global_udp_sessions as usize));
 
         for rule in self.config.rules.iter().filter(|rule| rule.enabled) {
             let status = RuleStatus {
@@ -1767,15 +1763,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 usage();
                 Ok(())
             }
-            command @ (
-                "list"
-                | "status"
-                | "limits"
-                | "start"
-                | "stop"
-                | "restart"
-                | "shutdown"
-            ) => {
+            command
+            @ ("list" | "status" | "limits" | "start" | "stop" | "restart" | "shutdown") => {
                 let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));
                 print!("{}", send_command(&socket, command).await?);
                 Ok(())

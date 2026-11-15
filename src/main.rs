@@ -1043,6 +1043,375 @@ async fn shell(socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error + S
     Ok(())
 }
 
+async fn write_menu_line<W: tokio::io::AsyncWrite + Unpin>(
+    stdout: &mut W,
+    line: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stdout.write_all(line.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn prompt_line<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    prompt: &str,
+    default: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let suffix = default.map_or_else(String::new, |value| format!(" [{value}]"));
+    stdout
+        .write_all(format!("{prompt}{suffix}: ").as_bytes())
+        .await?;
+    stdout.flush().await?;
+    let Some(line) = lines.next_line().await? else {
+        return Ok(None);
+    };
+    let value = line.trim();
+    if value.is_empty() {
+        return Ok(default.map(str::to_string));
+    }
+    Ok(Some(value.to_string()))
+}
+
+async fn prompt_required<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    prompt: &str,
+    default: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let Some(value) = prompt_line(lines, stdout, prompt, default).await? else {
+            return Ok(None);
+        };
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+        write_menu_line(stdout, "输入不能为空。").await?;
+    }
+}
+
+async fn prompt_u32<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    prompt: &str,
+    default: u32,
+) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let Some(value) = prompt_line(lines, stdout, prompt, Some(&default.to_string())).await?
+        else {
+            return Ok(None);
+        };
+        match value.parse::<u32>() {
+            Ok(number) => return Ok(Some(number)),
+            Err(_) => write_menu_line(stdout, "请输入有效的数字。").await?,
+        }
+    }
+}
+
+async fn prompt_u64<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    prompt: &str,
+    default: u64,
+) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let Some(value) = prompt_line(lines, stdout, prompt, Some(&default.to_string())).await?
+        else {
+            return Ok(None);
+        };
+        match value.parse::<u64>() {
+            Ok(number) => return Ok(Some(number)),
+            Err(_) => write_menu_line(stdout, "请输入有效的数字。").await?,
+        }
+    }
+}
+
+async fn prompt_bool<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    prompt: &str,
+    default: bool,
+) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let default_text = if default { "Y" } else { "N" };
+    loop {
+        let Some(value) = prompt_line(lines, stdout, prompt, Some(default_text)).await? else {
+            return Ok(None);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "1" => return Ok(Some(true)),
+            "n" | "no" | "0" => return Ok(Some(false)),
+            _ => write_menu_line(stdout, "请输入 y 或 n。").await?,
+        }
+    }
+}
+
+async fn prompt_network<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    default: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let Some(value) = prompt_line(lines, stdout, "协议", Some(default)).await? else {
+            return Ok(None);
+        };
+        if matches!(value.as_str(), "tcp" | "udp" | "both") {
+            return Ok(Some(value));
+        }
+        write_menu_line(stdout, "只能填写 tcp、udp 或 both。").await?;
+    }
+}
+
+async fn fetch_rules(
+    socket_path: &Path,
+) -> Result<Vec<Rule>, Box<dyn std::error::Error + Send + Sync>> {
+    let response = send_command(socket_path, "list").await?;
+    serde_json::from_str(response.trim()).map_err(|error| boxed_error(error.to_string()))
+}
+
+async fn print_rules<W: tokio::io::AsyncWrite + Unpin>(
+    socket_path: &Path,
+    stdout: &mut W,
+) -> Result<Vec<Rule>, Box<dyn std::error::Error + Send + Sync>> {
+    let rules = fetch_rules(socket_path).await?;
+    if rules.is_empty() {
+        write_menu_line(stdout, "当前没有转发规则。").await?;
+        return Ok(rules);
+    }
+    write_menu_line(stdout, "当前转发规则：").await?;
+    for (index, rule) in rules.iter().enumerate() {
+        write_menu_line(
+            stdout,
+            &format!(
+                "  {}. {} [{}] {} -> {} {}",
+                index + 1,
+                if rule.name.is_empty() {
+                    &rule.id
+                } else {
+                    &rule.name
+                },
+                rule.network,
+                rule.listen,
+                rule.target,
+                if rule.enabled { "启用" } else { "禁用" }
+            ),
+        )
+        .await?;
+    }
+    Ok(rules)
+}
+
+async fn read_rule<R, W>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    base: Option<&Rule>,
+) -> Result<Option<Rule>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let name_default = base
+        .map(|rule| rule.name.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("线路A");
+    let Some(name) = prompt_required(lines, stdout, "规则名称", Some(name_default)).await?
+    else {
+        return Ok(None);
+    };
+    let network_default = base.map_or("tcp", |rule| rule.network.as_str());
+    let Some(network) = prompt_network(lines, stdout, network_default).await? else {
+        return Ok(None);
+    };
+    let listen_default = base.map_or("[::]:50001", |rule| rule.listen.as_str());
+    let Some(listen) = prompt_required(lines, stdout, "监听地址", Some(listen_default)).await?
+    else {
+        return Ok(None);
+    };
+    let target_default = base.map_or("127.0.0.1:50001", |rule| rule.target.as_str());
+    let Some(target) = prompt_required(lines, stdout, "目标地址", Some(target_default)).await?
+    else {
+        return Ok(None);
+    };
+    let max_default = base.map_or(DEFAULT_MAX_CONNECTIONS, |rule| rule.max_connections);
+    let Some(max_connections) = prompt_u32(lines, stdout, "最大会话数", max_default).await?
+    else {
+        return Ok(None);
+    };
+    let timeout_default = base.map_or(DEFAULT_UDP_TIMEOUT, |rule| rule.udp_timeout);
+    let Some(udp_timeout) = prompt_u64(lines, stdout, "UDP 超时秒数", timeout_default).await?
+    else {
+        return Ok(None);
+    };
+    let enabled_default = base.map_or(true, |rule| rule.enabled);
+    let Some(enabled) = prompt_bool(lines, stdout, "是否启用", enabled_default).await? else {
+        return Ok(None);
+    };
+    Ok(Some(Rule {
+        id: base.map_or_else(String::new, |rule| rule.id.clone()),
+        name,
+        enabled,
+        network,
+        listen,
+        target,
+        max_connections,
+        udp_timeout,
+    }))
+}
+
+async fn choose_rule<R, W>(
+    socket_path: &Path,
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+) -> Result<Option<Rule>, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let rules = print_rules(socket_path, stdout).await?;
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    loop {
+        let Some(value) = prompt_required(lines, stdout, "选择规则编号或 ID", None).await?
+        else {
+            return Ok(None);
+        };
+        if let Ok(index) = value.parse::<usize>() {
+            if let Some(rule) = rules.get(index.saturating_sub(1)) {
+                return Ok(Some(rule.clone()));
+            }
+        }
+        if let Some(rule) = rules.iter().find(|rule| rule.id == value) {
+            return Ok(Some(rule.clone()));
+        }
+        write_menu_line(stdout, "没有找到这个规则。").await?;
+    }
+}
+
+async fn print_response<W: tokio::io::AsyncWrite + Unpin>(
+    stdout: &mut W,
+    response: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stdout.write_all(response.as_bytes()).await?;
+    if !response.ends_with('\n') {
+        stdout.write_all(b"\n").await?;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn interactive_menu(
+    socket_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stdin = tokio::io::stdin();
+    let mut lines = AsyncBufReader::new(stdin).lines();
+    let mut stdout = tokio::io::stdout();
+    loop {
+        stdout.write_all(b"\n").await?;
+        write_menu_line(&mut stdout, "+--------------------------------------+").await?;
+        write_menu_line(&mut stdout, "| RelayDeck Lite 转发管理              |").await?;
+        write_menu_line(&mut stdout, "+--------------------------------------+").await?;
+        write_menu_line(&mut stdout, "| 0. 退出菜单                          |").await?;
+        write_menu_line(&mut stdout, "| 1. 查看转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 2. 查看运行状态                      |").await?;
+        write_menu_line(&mut stdout, "| 3. 新建转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 4. 修改转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 5. 删除转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 6. 启动转发                          |").await?;
+        write_menu_line(&mut stdout, "| 7. 停止转发                          |").await?;
+        write_menu_line(&mut stdout, "| 8. 重启转发                          |").await?;
+        write_menu_line(&mut stdout, "| 9. 显示命令帮助                      |").await?;
+        write_menu_line(&mut stdout, "+--------------------------------------+").await?;
+        let Some(choice) = prompt_line(&mut lines, &mut stdout, "请选择", None).await? else {
+            break;
+        };
+        match choice.as_str() {
+            "0" | "q" | "quit" | "exit" => break,
+            "1" => {
+                print_rules(&socket_path, &mut stdout).await?;
+            }
+            "2" => {
+                let response = send_command(&socket_path, "status").await?;
+                print_response(&mut stdout, &response).await?;
+            }
+            "3" => {
+                if let Some(rule) = read_rule(&mut lines, &mut stdout, None).await? {
+                    let json = serde_json::to_string(&rule)?;
+                    let response = send_command(&socket_path, &format!("add {json}")).await?;
+                    print_response(&mut stdout, &response).await?;
+                }
+            }
+            "4" => {
+                if let Some(existing) = choose_rule(&socket_path, &mut lines, &mut stdout).await? {
+                    if let Some(rule) = read_rule(&mut lines, &mut stdout, Some(&existing)).await? {
+                        let json = serde_json::to_string(&rule)?;
+                        let response =
+                            send_command(&socket_path, &format!("update {} {json}", existing.id))
+                                .await?;
+                        print_response(&mut stdout, &response).await?;
+                    }
+                }
+            }
+            "5" => {
+                if let Some(rule) = choose_rule(&socket_path, &mut lines, &mut stdout).await? {
+                    let Some(confirm) =
+                        prompt_line(&mut lines, &mut stdout, "确认删除？输入 y", Some("n")).await?
+                    else {
+                        break;
+                    };
+                    if matches!(confirm.to_ascii_lowercase().as_str(), "y" | "yes") {
+                        let response =
+                            send_command(&socket_path, &format!("delete {}", rule.id)).await?;
+                        print_response(&mut stdout, &response).await?;
+                    }
+                }
+            }
+            "6" => {
+                let response = send_command(&socket_path, "start").await?;
+                print_response(&mut stdout, &response).await?;
+            }
+            "7" => {
+                let response = send_command(&socket_path, "stop").await?;
+                print_response(&mut stdout, &response).await?;
+            }
+            "8" => {
+                let response = send_command(&socket_path, "restart").await?;
+                print_response(&mut stdout, &response).await?;
+            }
+            "9" => {
+                let response = send_command(&socket_path, "help").await?;
+                print_response(&mut stdout, &response).await?;
+            }
+            _ => write_menu_line(&mut stdout, "无效选项，请重新选择。").await?,
+        }
+    }
+    Ok(())
+}
+
 fn option(args: &[String], name: &str, default: &str) -> String {
     args.windows(2)
         .find(|pair| pair[0] == name)
@@ -1118,6 +1487,7 @@ fn usage() {
     println!(
         "RelayDeck Lite\n\
          Usage:\n\
+           relaydeck-lite [menu] [--socket PATH]\n\
            relaydeck-lite run [--config PATH] [--socket PATH]\n\
            relaydeck-lite shell [--socket PATH]\n\
            relaydeck-lite list|status|start|stop|restart|shutdown [--socket PATH]\n\
@@ -1129,7 +1499,7 @@ fn usage() {
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
-    let command = args.get(1).map(String::as_str).unwrap_or("help");
+    let command = args.get(1).map(String::as_str).unwrap_or("menu");
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1137,6 +1507,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let result = runtime.block_on(async {
         match command {
+            "menu" => {
+                let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));
+                interactive_menu(socket).await
+            }
             "run" => {
                 let config = PathBuf::from(option(&args, "--config", DEFAULT_CONFIG));
                 let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));

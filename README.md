@@ -31,6 +31,16 @@ Debian 使用 `deploy/relaydeck-lite.service`，Alpine 使用 `deploy/relaydeck-
 
 ## 终端管理
 
+直接运行程序会进入编号菜单，适合没有 Web 面板的 Alpine/Debian 容器：
+
+```bash
+relaydeck-lite
+# 或
+relaydeck-lite menu
+```
+
+菜单中可以逐项完成查看、新建、修改、删除、启动、停止和重启转发规则；输入 `0` 退出菜单。也可以用 `--socket PATH` 连接到自定义控制 socket。
+
 查看规则和状态：
 
 ```bash

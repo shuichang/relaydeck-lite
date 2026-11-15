@@ -111,6 +111,10 @@ download() {
     "$1" -o "$2"
 }
 
+sed_escape() {
+  printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+}
+
 if [ "$VERSION" = "latest" ]; then
   log "正在获取最新版本..."
   TAG="$(
@@ -144,6 +148,7 @@ EXPECTED_SHA="$(
 printf '%s  %s\n' "$EXPECTED_SHA" "$ARCHIVE" | sha256sum -c -
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+mkdir -p "$(dirname "$SOCKET_PATH")"
 chmod 0755 "$INSTALL_DIR"
 chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
@@ -152,7 +157,14 @@ install -m 0755 "${TMP_DIR}/relaydeck-lite" "${INSTALL_DIR}/relaydeck-lite"
 SERVICE_STARTED=0
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   SERVICE_FILE="${TMP_DIR}/relaydeck-lite.service"
-  download "${RAW_BASE}/${TAG}/deploy/relaydeck-lite.service" "$SERVICE_FILE"
+  SERVICE_RAW="${TMP_DIR}/relaydeck-lite.service.raw"
+  download "${RAW_BASE}/${TAG}/deploy/relaydeck-lite.service" "$SERVICE_RAW"
+  sed \
+    -e "s|/usr/local/bin/relaydeck-lite|$(sed_escape "${INSTALL_DIR}/relaydeck-lite")|g" \
+    -e "s|/etc/relaydeck-lite/rules.json|$(sed_escape "${CONFIG_DIR}/rules.json")|g" \
+    -e "s|/var/lib/relaydeck-lite|$(sed_escape "$DATA_DIR")|g" \
+    -e "s|/run/relaydeck-lite.sock|$(sed_escape "$SOCKET_PATH")|g" \
+    "$SERVICE_RAW" > "$SERVICE_FILE"
   install -m 0644 "$SERVICE_FILE" /etc/systemd/system/relaydeck-lite.service
   systemctl daemon-reload
   if [ "$NO_START" -eq 0 ]; then
@@ -163,7 +175,14 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   fi
 elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
   SERVICE_FILE="${TMP_DIR}/relaydeck-lite.openrc"
-  download "${RAW_BASE}/${TAG}/deploy/relaydeck-lite.openrc" "$SERVICE_FILE"
+  SERVICE_RAW="${TMP_DIR}/relaydeck-lite.openrc.raw"
+  download "${RAW_BASE}/${TAG}/deploy/relaydeck-lite.openrc" "$SERVICE_RAW"
+  sed \
+    -e "s|/usr/local/bin/relaydeck-lite|$(sed_escape "${INSTALL_DIR}/relaydeck-lite")|g" \
+    -e "s|/etc/relaydeck-lite/rules.json|$(sed_escape "${CONFIG_DIR}/rules.json")|g" \
+    -e "s|/var/lib/relaydeck-lite|$(sed_escape "$DATA_DIR")|g" \
+    -e "s|/run/relaydeck-lite.sock|$(sed_escape "$SOCKET_PATH")|g" \
+    "$SERVICE_RAW" > "$SERVICE_FILE"
   install -m 0755 "$SERVICE_FILE" /etc/init.d/relaydeck-lite
   rc-update add relaydeck-lite default >/dev/null 2>&1 || true
   if [ "$NO_START" -eq 0 ]; then

@@ -9,7 +9,6 @@ RelayDeck Lite 是 RelayDeck 的轻量 Rust 分支，面向 128 MiB 内存、低
 ## 构建
 
 ```bash
-cd rust-lite
 cargo build --release
 strip target/release/relaydeck-lite
 ```

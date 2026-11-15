@@ -8,6 +8,14 @@ RelayDeck Lite 是 RelayDeck 的轻量 Rust 分支，面向 128 MiB 内存、低
 
 ## 构建
 
+一键安装（Alpine/Debian，x86_64）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck-lite/main/scripts/install.sh)
+```
+
+安装完成后会自动进入终端菜单；使用 `--no-menu` 可以只安装不进入菜单。
+
 ```bash
 cargo build --release
 strip target/release/relaydeck-lite

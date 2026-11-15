@@ -35,16 +35,19 @@ use tokio::net::{UnixListener, UnixStream};
 
 const DEFAULT_CONFIG: &str = "/etc/relaydeck-lite/rules.json";
 const DEFAULT_SOCKET: &str = "/run/relaydeck-lite.sock";
-const DEFAULT_MAX_CONNECTIONS: u32 = 512;
+const DEFAULT_LIMITS_FILE_NAME: &str = "limits.json";
+const DEFAULT_MAX_CONNECTIONS: u32 = 2048;
 const DEFAULT_UDP_TIMEOUT: u64 = 60;
 const MAX_RULES: usize = 256;
-const GLOBAL_TCP_SESSIONS: usize = 512;
-const GLOBAL_UDP_SESSIONS: usize = 256;
+const DEFAULT_GLOBAL_TCP_SESSIONS: u32 = 2048;
+const DEFAULT_GLOBAL_UDP_SESSIONS: u32 = 256;
+const MAX_GLOBAL_SESSIONS: u32 = 65_536;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TARGET_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
 const MAX_CONFIG_BYTES: usize = 512 * 1024;
+const MAX_LIMITS_BYTES: usize = 16 * 1024;
 const MAX_RULE_TEXT_BYTES: usize = 4096;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -60,6 +63,14 @@ fn default_max_connections() -> u32 {
 
 fn default_udp_timeout() -> u64 {
     DEFAULT_UDP_TIMEOUT
+}
+
+fn default_global_tcp_sessions() -> u32 {
+    DEFAULT_GLOBAL_TCP_SESSIONS
+}
+
+fn default_global_udp_sessions() -> u32 {
+    DEFAULT_GLOBAL_UDP_SESSIONS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,6 +94,23 @@ struct Rule {
 struct Config {
     #[serde(default)]
     rules: Vec<Rule>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Limits {
+    #[serde(default = "default_global_tcp_sessions")]
+    global_tcp_sessions: u32,
+    #[serde(default = "default_global_udp_sessions")]
+    global_udp_sessions: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            global_tcp_sessions: DEFAULT_GLOBAL_TCP_SESSIONS,
+            global_udp_sessions: DEFAULT_GLOBAL_UDP_SESSIONS,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,7 +138,9 @@ struct Runtime {
 
 struct Controller {
     config_path: PathBuf,
+    limits_path: PathBuf,
     config: Config,
+    limits: Limits,
     runtime: Runtime,
 }
 
@@ -336,6 +366,52 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error + Send +
     Ok(config)
 }
 
+fn validate_limits(limits: &Limits) -> Result<(), String> {
+    for (name, value) in [
+        ("global_tcp_sessions", limits.global_tcp_sessions),
+        ("global_udp_sessions", limits.global_udp_sessions),
+    ] {
+        if value == 0 || value > MAX_GLOBAL_SESSIONS {
+            return Err(format!(
+                "{name} must be between 1 and {MAX_GLOBAL_SESSIONS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_limits(path: &Path) -> Result<Limits, Box<dyn std::error::Error + Send + Sync>> {
+    let mut limits = if !path.exists() {
+        Limits::default()
+    } else {
+        let size = fs::metadata(path)?.len();
+        if size > MAX_LIMITS_BYTES as u64 {
+            return Err(boxed_error(format!(
+                "limits configuration exceeds {MAX_LIMITS_BYTES} bytes"
+            )));
+        }
+        let data = fs::read(path)?;
+        serde_json::from_slice(&data)?
+    };
+
+    if let Some(value) = env::var_os("RELAYDECK_GLOBAL_TCP_SESSIONS") {
+        limits.global_tcp_sessions = value
+            .to_str()
+            .ok_or_else(|| boxed_error("RELAYDECK_GLOBAL_TCP_SESSIONS is not valid UTF-8"))?
+            .parse()
+            .map_err(|_| boxed_error("RELAYDECK_GLOBAL_TCP_SESSIONS must be an integer"))?;
+    }
+    if let Some(value) = env::var_os("RELAYDECK_GLOBAL_UDP_SESSIONS") {
+        limits.global_udp_sessions = value
+            .to_str()
+            .ok_or_else(|| boxed_error("RELAYDECK_GLOBAL_UDP_SESSIONS is not valid UTF-8"))?
+            .parse()
+            .map_err(|_| boxed_error("RELAYDECK_GLOBAL_UDP_SESSIONS must be an integer"))?;
+    }
+    validate_limits(&limits).map_err(boxed_error)?;
+    Ok(limits)
+}
+
 fn save_config(
     path: &Path,
     config: &Config,
@@ -370,6 +446,40 @@ fn save_config(
     result
 }
 
+fn save_limits(
+    path: &Path,
+    limits: &Limits,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    validate_limits(limits).map_err(boxed_error)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
+    let data = serde_json::to_vec_pretty(limits)?;
+    if data.len() > MAX_LIMITS_BYTES {
+        return Err(boxed_error(format!(
+            "limits configuration exceeds {MAX_LIMITS_BYTES} bytes"
+        )));
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut file = File::create(&temp)?;
+        set_private_mode(&temp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        sync_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 async fn persist_config(
     path: &Path,
     config: &Config,
@@ -379,6 +489,17 @@ async fn persist_config(
     tokio::task::spawn_blocking(move || save_config(&path, &config))
         .await
         .map_err(|error| boxed_error(format!("configuration writer task failed: {error}")))?
+}
+
+async fn persist_limits(
+    path: &Path,
+    limits: &Limits,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.to_path_buf();
+    let limits = limits.clone();
+    tokio::task::spawn_blocking(move || save_limits(&path, &limits))
+        .await
+        .map_err(|error| boxed_error(format!("limits writer task failed: {error}")))?
 }
 
 fn set_private_mode(path: &Path) -> io::Result<()> {
@@ -406,8 +527,12 @@ impl Controller {
         let (cancel, receiver) = watch::channel(self.runtime.generation);
         let mut handles = Vec::new();
         let mut statuses = HashMap::new();
-        let global_tcp = Arc::new(Semaphore::new(GLOBAL_TCP_SESSIONS));
-        let global_udp = Arc::new(Semaphore::new(GLOBAL_UDP_SESSIONS));
+        let global_tcp = Arc::new(Semaphore::new(
+            self.limits.global_tcp_sessions as usize,
+        ));
+        let global_udp = Arc::new(Semaphore::new(
+            self.limits.global_udp_sessions as usize,
+        ));
 
         for rule in self.config.rules.iter().filter(|rule| rule.enabled) {
             let status = RuleStatus {
@@ -545,9 +670,41 @@ impl Controller {
         serde_json::to_string_pretty(&serde_json::json!({
             "active": self.runtime.active,
             "error": self.runtime.error,
+            "limits": self.limits,
             "rules": statuses,
         }))
         .map_err(|error| error.to_string())
+    }
+
+    async fn commit_limits(&mut self, candidate: Limits) -> Result<(), String> {
+        validate_limits(&candidate)?;
+        let previous = self.limits.clone();
+        let previous_config_error = self.runtime.config_error;
+        if let Err(error) = persist_limits(&self.limits_path, &candidate).await {
+            return Err(format!("limits save failed: {error}"));
+        }
+        self.limits = candidate;
+        self.runtime.config_error = false;
+        if !self.runtime.active {
+            self.runtime.error.clear();
+            return Ok(());
+        }
+        if let Err(error) = self.restart().await {
+            self.limits = previous.clone();
+            self.runtime.config_error = previous_config_error;
+            let restore_error = persist_limits(&self.limits_path, &previous)
+                .await
+                .err()
+                .map(|restore| restore.to_string());
+            let restart_error = self.restart().await.err();
+            return Err(match (restore_error, restart_error) {
+                (None, None) => format!("new limits failed and were rolled back: {error}"),
+                (restore, restart) => format!(
+                    "new limits failed: {error}; rollback failed: restore={restore:?}, restart={restart:?}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     async fn commit_config(&mut self, candidate: Config) -> Result<(), String> {
@@ -780,7 +937,7 @@ async fn handle_command(
     }
     if command == "help" {
         return Ok(CommandResult::Text(
-            "list | status | add <json> | update <id> <json> | delete <id> | start | stop | restart | shutdown"
+            "list | status | limits | set-limits <json> | add <json> | update <id> <json> | delete <id> | start | stop | restart | shutdown"
                 .to_string(),
         ));
     }
@@ -794,6 +951,15 @@ async fn handle_command(
             .map(CommandResult::Text)
             .map_err(|error| error.to_string()),
         "status" => guard.status_json().map(CommandResult::Text),
+        "limits" => serde_json::to_string_pretty(&guard.limits)
+            .map(CommandResult::Text)
+            .map_err(|error| error.to_string()),
+        "set-limits" => {
+            let limits: Limits =
+                serde_json::from_str(argument).map_err(|error| error.to_string())?;
+            guard.commit_limits(limits).await?;
+            Ok(CommandResult::Text("ok limits updated".to_string()))
+        }
         "start" => {
             guard.start().await?;
             Ok(CommandResult::Text("ok started".to_string()))
@@ -1193,6 +1359,13 @@ async fn fetch_rules(
     serde_json::from_str(response.trim()).map_err(|error| boxed_error(error.to_string()))
 }
 
+async fn fetch_limits(
+    socket_path: &Path,
+) -> Result<Limits, Box<dyn std::error::Error + Send + Sync>> {
+    let response = send_command(socket_path, "limits").await?;
+    serde_json::from_str(response.trim()).map_err(|error| boxed_error(error.to_string()))
+}
+
 async fn print_rules<W: tokio::io::AsyncWrite + Unpin>(
     socket_path: &Path,
     stdout: &mut W,
@@ -1282,6 +1455,54 @@ where
     }))
 }
 
+async fn edit_limits<R, W>(
+    socket_path: &Path,
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let current = fetch_limits(socket_path).await?;
+    write_menu_line(
+        stdout,
+        &format!(
+            "当前全局上限：TCP {}，UDP {}",
+            current.global_tcp_sessions, current.global_udp_sessions
+        ),
+    )
+    .await?;
+    let Some(global_tcp_sessions) = prompt_u32(
+        lines,
+        stdout,
+        "全局 TCP 会话数",
+        current.global_tcp_sessions,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(global_udp_sessions) = prompt_u32(
+        lines,
+        stdout,
+        "全局 UDP 会话数",
+        current.global_udp_sessions,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let candidate = Limits {
+        global_tcp_sessions,
+        global_udp_sessions,
+    };
+    validate_limits(&candidate).map_err(boxed_error)?;
+    let json = serde_json::to_string(&candidate)?;
+    let response = send_command(socket_path, &format!("set-limits {json}")).await?;
+    print_response(stdout, &response).await
+}
+
 async fn choose_rule<R, W>(
     socket_path: &Path,
     lines: &mut tokio::io::Lines<R>,
@@ -1338,13 +1559,15 @@ async fn interactive_menu(
         write_menu_line(&mut stdout, "| 0. 退出菜单                          |").await?;
         write_menu_line(&mut stdout, "| 1. 查看转发规则                      |").await?;
         write_menu_line(&mut stdout, "| 2. 查看运行状态                      |").await?;
-        write_menu_line(&mut stdout, "| 3. 新建转发规则                      |").await?;
-        write_menu_line(&mut stdout, "| 4. 修改转发规则                      |").await?;
-        write_menu_line(&mut stdout, "| 5. 删除转发规则                      |").await?;
-        write_menu_line(&mut stdout, "| 6. 启动转发                          |").await?;
-        write_menu_line(&mut stdout, "| 7. 停止转发                          |").await?;
-        write_menu_line(&mut stdout, "| 8. 重启转发                          |").await?;
-        write_menu_line(&mut stdout, "| 9. 显示命令帮助                      |").await?;
+        write_menu_line(&mut stdout, "| 3. 查看全局连接上限                  |").await?;
+        write_menu_line(&mut stdout, "| 4. 修改全局连接上限                  |").await?;
+        write_menu_line(&mut stdout, "| 5. 新建转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 6. 修改转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 7. 删除转发规则                      |").await?;
+        write_menu_line(&mut stdout, "| 8. 启动转发                          |").await?;
+        write_menu_line(&mut stdout, "| 9. 停止转发                          |").await?;
+        write_menu_line(&mut stdout, "| 10. 重启转发                         |").await?;
+        write_menu_line(&mut stdout, "| 11. 显示命令帮助                     |").await?;
         write_menu_line(&mut stdout, "+--------------------------------------+").await?;
         let Some(choice) = prompt_line(&mut lines, &mut stdout, "请选择", None).await? else {
             break;
@@ -1359,13 +1582,20 @@ async fn interactive_menu(
                 print_response(&mut stdout, &response).await?;
             }
             "3" => {
+                let limits = fetch_limits(&socket_path).await?;
+                print_response(&mut stdout, &serde_json::to_string_pretty(&limits)?).await?;
+            }
+            "4" => {
+                edit_limits(&socket_path, &mut lines, &mut stdout).await?;
+            }
+            "5" => {
                 if let Some(rule) = read_rule(&mut lines, &mut stdout, None).await? {
                     let json = serde_json::to_string(&rule)?;
                     let response = send_command(&socket_path, &format!("add {json}")).await?;
                     print_response(&mut stdout, &response).await?;
                 }
             }
-            "4" => {
+            "6" => {
                 if let Some(existing) = choose_rule(&socket_path, &mut lines, &mut stdout).await? {
                     if let Some(rule) = read_rule(&mut lines, &mut stdout, Some(&existing)).await? {
                         let json = serde_json::to_string(&rule)?;
@@ -1376,7 +1606,7 @@ async fn interactive_menu(
                     }
                 }
             }
-            "5" => {
+            "7" => {
                 if let Some(rule) = choose_rule(&socket_path, &mut lines, &mut stdout).await? {
                     let Some(confirm) =
                         prompt_line(&mut lines, &mut stdout, "确认删除？输入 y", Some("n")).await?
@@ -1390,19 +1620,19 @@ async fn interactive_menu(
                     }
                 }
             }
-            "6" => {
+            "8" => {
                 let response = send_command(&socket_path, "start").await?;
                 print_response(&mut stdout, &response).await?;
             }
-            "7" => {
+            "9" => {
                 let response = send_command(&socket_path, "stop").await?;
                 print_response(&mut stdout, &response).await?;
             }
-            "8" => {
+            "10" => {
                 let response = send_command(&socket_path, "restart").await?;
                 print_response(&mut stdout, &response).await?;
             }
-            "9" => {
+            "11" => {
                 let response = send_command(&socket_path, "help").await?;
                 print_response(&mut stdout, &response).await?;
             }
@@ -1425,13 +1655,20 @@ async fn run_daemon(
     socket_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = bind_control_listener(&socket_path).await?;
+    let limits_path = config_path.with_file_name(DEFAULT_LIMITS_FILE_NAME);
     let (config, config_error) = match load_config(&config_path) {
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(error.to_string())),
     };
+    let (limits, limits_error) = match load_limits(&limits_path) {
+        Ok(limits) => (limits, None),
+        Err(error) => (Limits::default(), Some(error.to_string())),
+    };
     let controller = Arc::new(Mutex::new(Controller {
         config_path,
+        limits_path,
         config,
+        limits,
         runtime: Runtime::default(),
     }));
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -1441,6 +1678,11 @@ async fn run_daemon(
         let mut guard = controller.lock().await;
         guard.runtime.config_error = true;
         guard.runtime.error = format!("configuration load failed: {error}");
+        eprintln!("relaydeck-lite: {}", guard.runtime.error);
+    } else if let Some(error) = limits_error {
+        let mut guard = controller.lock().await;
+        guard.runtime.config_error = true;
+        guard.runtime.error = format!("limits configuration load failed: {error}");
         eprintln!("relaydeck-lite: {}", guard.runtime.error);
     } else if let Err(error) = controller.lock().await.start().await {
         eprintln!("relaydeck-lite: initial rule start failed: {error}");
@@ -1490,8 +1732,9 @@ fn usage() {
            relaydeck-lite [menu] [--socket PATH]\n\
            relaydeck-lite run [--config PATH] [--socket PATH]\n\
            relaydeck-lite shell [--socket PATH]\n\
-           relaydeck-lite list|status|start|stop|restart|shutdown [--socket PATH]\n\
+           relaydeck-lite list|status|limits|start|stop|restart|shutdown [--socket PATH]\n\
            relaydeck-lite add <JSON> [--socket PATH]\n\
+           relaydeck-lite set-limits <JSON> [--socket PATH]\n\
            relaydeck-lite update <ID> <JSON> [--socket PATH]\n\
            relaydeck-lite delete <ID> [--socket PATH]"
     );
@@ -1524,7 +1767,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 usage();
                 Ok(())
             }
-            command @ ("list" | "status" | "start" | "stop" | "restart" | "shutdown") => {
+            command @ (
+                "list"
+                | "status"
+                | "limits"
+                | "start"
+                | "stop"
+                | "restart"
+                | "shutdown"
+            ) => {
                 let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));
                 print!("{}", send_command(&socket, command).await?);
                 Ok(())
@@ -1535,6 +1786,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .ok_or_else(|| boxed_error("add requires JSON"))?;
                 let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));
                 print!("{}", send_command(&socket, &format!("add {json}")).await?);
+                Ok(())
+            }
+            "set-limits" => {
+                let json = args
+                    .get(2)
+                    .ok_or_else(|| boxed_error("set-limits requires JSON"))?;
+                let socket = PathBuf::from(option(&args, "--socket", DEFAULT_SOCKET));
+                print!(
+                    "{}",
+                    send_command(&socket, &format!("set-limits {json}")).await?
+                );
                 Ok(())
             }
             "update" => {
@@ -1589,6 +1851,28 @@ mod tests {
         assert_eq!(rule.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(rule.udp_timeout, DEFAULT_UDP_TIMEOUT);
         assert!(validate_rule(&rule).is_ok());
+    }
+
+    #[test]
+    fn limits_default_to_high_tcp_capacity() {
+        let limits: Limits = serde_json::from_str(r#"{}"#).expect("limits JSON");
+        assert_eq!(limits.global_tcp_sessions, DEFAULT_GLOBAL_TCP_SESSIONS);
+        assert_eq!(limits.global_udp_sessions, DEFAULT_GLOBAL_UDP_SESSIONS);
+        assert!(validate_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn limits_reject_zero_and_excessive_values() {
+        assert!(validate_limits(&Limits {
+            global_tcp_sessions: 0,
+            global_udp_sessions: DEFAULT_GLOBAL_UDP_SESSIONS,
+        })
+        .is_err());
+        assert!(validate_limits(&Limits {
+            global_tcp_sessions: MAX_GLOBAL_SESSIONS + 1,
+            global_udp_sessions: DEFAULT_GLOBAL_UDP_SESSIONS,
+        })
+        .is_err());
     }
 
     #[test]
@@ -1674,7 +1958,7 @@ mod tests {
             listener,
             target_addr,
             Arc::new(Semaphore::new(8)),
-            Arc::new(Semaphore::new(GLOBAL_TCP_SESSIONS)),
+            Arc::new(Semaphore::new(DEFAULT_GLOBAL_TCP_SESSIONS as usize)),
             receiver,
         ));
 
@@ -1711,7 +1995,7 @@ mod tests {
             listener,
             target_addr,
             Arc::new(Semaphore::new(8)),
-            Arc::new(Semaphore::new(GLOBAL_UDP_SESSIONS)),
+            Arc::new(Semaphore::new(DEFAULT_GLOBAL_UDP_SESSIONS as usize)),
             receiver,
         ));
 

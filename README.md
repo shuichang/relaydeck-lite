@@ -4,7 +4,9 @@ RelayDeck Lite 是 RelayDeck 的轻量 Rust 分支，面向 128 MiB 内存、低
 
 运行时使用 Tokio 单线程调度器。TCP 连接使用异步双向复制，UDP 使用按客户端地址建立的短生命周期关联。管理通过 Unix 控制 socket 完成，不启动 Web 服务。
 
-默认每条规则最多 512 个会话（`both` 规则的 TCP 与 UDP 共享这个上限），同时受进程级 512 个 TCP 会话和 256 个 UDP 会话预算约束，避免单条规则或多条规则把 128 MiB 容器的内存耗尽。需要更高容量时应先做 cgroup RSS 和连接压力测试，再调整源码常量与服务资源限制。
+默认每条规则最多 2048 个会话（`both` 规则的 TCP 与 UDP 共享这个上限），同时受进程级 2048 个 TCP 会话和 256 个 UDP 会话预算约束。全局上限保存在配置目录的 `limits.json`，可以从终端菜单修改；也可以用 `RELAYDECK_GLOBAL_TCP_SESSIONS` 和 `RELAYDECK_GLOBAL_UDP_SESSIONS` 环境变量覆盖。需要更高容量时应先做 cgroup RSS 和连接压力测试，再提高上限。
+
+环境变量优先于 `limits.json`；如果设置了环境变量，菜单修改对应的值会在当前进程中生效，但下次服务重启仍会恢复为环境变量的值。
 
 ## 构建
 
@@ -47,13 +49,38 @@ relaydeck-lite
 relaydeck-lite menu
 ```
 
-菜单中可以逐项完成查看、新建、修改、删除、启动、停止和重启转发规则；输入 `0` 退出菜单。也可以用 `--socket PATH` 连接到自定义控制 socket。
+菜单中可以逐项查看和修改全局 TCP/UDP 会话上限，并完成查看、新建、修改、删除、启动、停止和重启转发规则；输入 `0` 退出菜单。也可以用 `--socket PATH` 连接到自定义控制 socket。
 
 查看规则和状态：
 
 ```bash
 relaydeck-lite list
 relaydeck-lite status
+```
+
+查看和修改全局连接上限：
+
+```bash
+relaydeck-lite limits
+relaydeck-lite set-limits '{"global_tcp_sessions":2048,"global_udp_sessions":256}'
+```
+
+也可以通过环境变量覆盖配置文件中的值：
+
+```bash
+RELAYDECK_GLOBAL_TCP_SESSIONS=4096 \
+RELAYDECK_GLOBAL_UDP_SESSIONS=512 \
+relaydeck-lite run --config /etc/relaydeck-lite/rules.json --socket /run/relaydeck-lite.sock
+```
+
+作为 systemd 或 OpenRC 服务运行时，把环境变量写入 `/etc/relaydeck-lite/limits.env`，例如：
+
+```bash
+cat >/etc/relaydeck-lite/limits.env <<'EOF'
+RELAYDECK_GLOBAL_TCP_SESSIONS=4096
+RELAYDECK_GLOBAL_UDP_SESSIONS=512
+EOF
+rc-service relaydeck-lite restart
 ```
 
 新增一条 TCP 规则：

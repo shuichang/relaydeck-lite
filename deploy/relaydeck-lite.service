@@ -9,6 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/var/lib/relaydeck-lite
 ExecStart=/usr/local/bin/relaydeck-lite run --config /etc/relaydeck-lite/rules.json --socket /run/relaydeck-lite.sock
+EnvironmentFile=-/etc/relaydeck-lite/limits.env
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s

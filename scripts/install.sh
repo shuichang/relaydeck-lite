@@ -47,6 +47,8 @@ RelayDeck Lite 安装脚本
   RELAYDECK_CONFIG_DIR    配置目录，默认 /etc/relaydeck-lite
   RELAYDECK_DATA_DIR      数据目录，默认 /var/lib/relaydeck-lite
   RELAYDECK_SOCKET        控制 socket，默认 /run/relaydeck-lite.sock
+  RELAYDECK_GLOBAL_TCP_SESSIONS  全局 TCP 会话上限
+  RELAYDECK_GLOBAL_UDP_SESSIONS  全局 UDP 会话上限
   RELAYDECK_INSTALL_NO_MENU=1  安装后不进入菜单
 EOF
 }
@@ -162,6 +164,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   sed \
     -e "s|/usr/local/bin/relaydeck-lite|$(sed_escape "${INSTALL_DIR}/relaydeck-lite")|g" \
     -e "s|/etc/relaydeck-lite/rules.json|$(sed_escape "${CONFIG_DIR}/rules.json")|g" \
+    -e "s|/etc/relaydeck-lite/limits.env|$(sed_escape "${CONFIG_DIR}/limits.env")|g" \
     -e "s|/var/lib/relaydeck-lite|$(sed_escape "$DATA_DIR")|g" \
     -e "s|/run/relaydeck-lite.sock|$(sed_escape "$SOCKET_PATH")|g" \
     "$SERVICE_RAW" > "$SERVICE_FILE"
@@ -180,6 +183,7 @@ elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>
   sed \
     -e "s|/usr/local/bin/relaydeck-lite|$(sed_escape "${INSTALL_DIR}/relaydeck-lite")|g" \
     -e "s|/etc/relaydeck-lite/rules.json|$(sed_escape "${CONFIG_DIR}/rules.json")|g" \
+    -e "s|/etc/relaydeck-lite/limits.env|$(sed_escape "${CONFIG_DIR}/limits.env")|g" \
     -e "s|/var/lib/relaydeck-lite|$(sed_escape "$DATA_DIR")|g" \
     -e "s|/run/relaydeck-lite.sock|$(sed_escape "$SOCKET_PATH")|g" \
     "$SERVICE_RAW" > "$SERVICE_FILE"

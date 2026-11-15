@@ -12,6 +12,11 @@ supervise_daemon_args="--respawn-delay 2 --respawn-max 10 --respawn-period 60"
 retry="SIGTERM/10/SIGKILL/5"
 umask=0077
 
+if [ -f /etc/relaydeck-lite/limits.env ]; then
+	. /etc/relaydeck-lite/limits.env
+	export RELAYDECK_GLOBAL_TCP_SESSIONS RELAYDECK_GLOBAL_UDP_SESSIONS
+fi
+
 start_pre() {
 	ulimit -n 65535 || return 1
 }

@@ -87,6 +87,7 @@ jobs:
           bash -n scripts/install.sh
           shellcheck scripts/install.sh
           bash -n deploy/relaydeck-lite.openrc
+          grep -Fq 'retry="SIGTERM/10/SIGKILL/5"' deploy/relaydeck-lite.openrc
           grep -Fq 'ExecStart=/usr/local/bin/relaydeck-lite run' deploy/relaydeck-lite.service
 
   publish:

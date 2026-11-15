@@ -9,7 +9,7 @@ directory="/var/lib/relaydeck-lite"
 pidfile="/run/relaydeck-lite.pid"
 supervisor=supervise-daemon
 supervise_daemon_args="--respawn-delay 2 --respawn-max 10 --respawn-period 60"
-retry="SIGTERM/10 SIGKILL/5"
+retry="SIGTERM/10/SIGKILL/5"
 umask=0077
 
 start_pre() {
